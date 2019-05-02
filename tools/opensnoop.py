@@ -76,6 +76,8 @@ for flag in args.flag_filter or []:
     except AttributeError:
         exit("Bad flag: %s" % flag)
 
+TASK_COMM_LEN = 16 # linux/sched.h
+
 # define BPF program
 bpf_text = """
 #include <uapi/linux/ptrace.h>
@@ -113,13 +115,20 @@ int trace_entry(struct pt_regs *ctx, int dfd, const char __user *filename, int f
     PID_TID_FILTER
     UID_FILTER
     FLAGS_FILTER
-    if (bpf_get_current_comm(&val.comm, sizeof(val.comm)) == 0) {
-        val.id = id;
-        val.fname = filename;
-        val.flags = flags; // EXTENDED_STRUCT_MEMBER
-        infotmp.update(&id, &val);
+
+    if (bpf_get_current_comm(&val.comm, sizeof(val.comm)) != 0) {
+        return 0;
     }
 
+    NAME_FILTER
+
+    PROCESS:
+    val.id = id;
+    val.fname = filename;
+    val.flags = flags; // EXTENDED_STRUCT_MEMBER
+    infotmp.update(&id, &val);
+
+    SKIP:
     return 0;
 };
 
@@ -171,6 +180,23 @@ else:
 if not (args.extended_fields or args.flag_filter):
     bpf_text = '\n'.join(x for x in bpf_text.split('\n')
         if 'EXTENDED_STRUCT_MEMBER' not in x)
+if args.name:
+    name_bytes = bytes(args.name)
+    if len(name_bytes) == 0 or len(name_bytes) > TASK_COMM_LEN:
+        exit("'--name' must be > 0 bytes and less than TASK_COMM_LEN (%d, from linux/sched.h) bytes). It is %d bytes long"
+                % (TASK_COMM_LEN, len(name_bytes)))
+    clauses = []
+    for i in xrange(0, len(name_bytes)):
+        char = name_bytes[i]
+        clauses.append("val.comm[%d] == '%s'" % (i, char))
+    bpf_text = bpf_text.replace( 'NAME_FILTER',
+    '''if (%s) {
+        goto PROCESS;
+    } else {
+        goto SKIP;
+    }''' % (" && ".join(clauses)))
+else:
+    bpf_text = bpf_text.replace('NAME_FILTER', '')
 if debug or args.ebpf:
     print(bpf_text)
     if args.ebpf:
@@ -211,9 +237,6 @@ def print_event(cpu, data, size):
         initial_ts = event.ts
 
     if args.failed and (event.ret >= 0):
-        return
-
-    if args.name and bytes(args.name) not in event.comm:
         return
 
     if args.timestamp:
